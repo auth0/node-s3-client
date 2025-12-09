@@ -1,0 +1,250 @@
+name: Publish to Public NPM
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (preview without publishing)"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    name: Build & Publish to Public NPM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Determine dry run mode
+        id: dry_run_mode
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "DRY_RUN=true" >> $GITHUB_ENV
+            echo "Running in DRY RUN mode (PR)"
+          elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/master" ]; then
+            echo "DRY_RUN=false" >> $GITHUB_ENV
+            echo "Running in PUBLISH mode (merged to master)"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "DRY_RUN=${{ github.event.inputs.dry_run }}" >> $GITHUB_ENV
+            echo "Running in MANUAL mode (dry_run=${{ github.event.inputs.dry_run }})"
+          else
+            echo "DRY_RUN=true" >> $GITHUB_ENV
+            echo "Running in DRY RUN mode (default)"
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "yarn"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Detect version and npm tag from package.json
+        id: detect
+        run: |
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+
+          determine_tag() {
+            local version=$1
+            if [[ "$version" == *"alpha"* ]]; then
+              echo "alpha"
+            elif [[ "$version" == *"beta"* ]]; then
+              echo "beta"
+            elif [[ "$version" == *"rc"* ]]; then
+              echo "next"
+            else
+              echo "latest"
+            fi
+          }
+
+          NPM_TAG=$(determine_tag "$VERSION")
+
+          echo "Detected from package.json:"
+          echo "Package: $PACKAGE_NAME"
+          echo "Version: $VERSION"
+          echo "NPM Tag: ${NPM_TAG}"
+
+          echo "PACKAGE_NAME=${PACKAGE_NAME}" >> $GITHUB_ENV
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "NPM_TAG=${NPM_TAG}" >> $GITHUB_ENV
+
+      - name: Check if version already exists on npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "Checking if ${PACKAGE_NAME}@${VERSION} already exists on npm..."
+
+          # Check if the specific version exists
+          if npm view "${PACKAGE_NAME}@${VERSION}" version 2>/dev/null; then
+            echo "❌ ERROR: Version ${VERSION} already exists on npm!"
+            echo "Please bump the version in package.json before publishing."
+            exit 1
+          else
+            echo "✅ Version ${VERSION} does not exist on npm. Safe to publish."
+          fi
+
+      - name: Check if git tag already exists
+        run: |
+          TAG_NAME="v${VERSION}"
+          echo "Checking if git tag ${TAG_NAME} already exists..."
+
+          if git rev-parse "${TAG_NAME}" >/dev/null 2>&1; then
+            echo "❌ ERROR: Git tag ${TAG_NAME} already exists!"
+            echo "Please use a different version or delete the existing tag."
+            exit 1
+          else
+            echo "✅ Git tag ${TAG_NAME} does not exist. Safe to proceed."
+          fi
+
+      - name: Run tests
+        run: yarn test
+
+      - name: Update package for public npm
+        run: |
+          node -e "
+            const pkg = require('./package.json');
+            
+            pkg.publishConfig = {
+              access: 'public',
+              registry: 'https://registry.npmjs.org/'
+            };
+            
+            require('fs').writeFileSync('./package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Publish package to public npm
+        id: publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "Publishing ${PACKAGE_NAME}@${VERSION} with tag: ${NPM_TAG}"
+          echo "Dry run mode: ${DRY_RUN}"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "DRY RUN - Skipping publish"
+            npm publish --dry-run --tag="${NPM_TAG}"
+            echo "published=dry-run" >> $GITHUB_OUTPUT
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+            echo "package_name=${PACKAGE_NAME}" >> $GITHUB_OUTPUT
+
+            echo "Published ${PACKAGE_NAME}@${VERSION} (dry run)"
+          else
+            npm publish --tag="${NPM_TAG}"
+            echo "published=true" >> $GITHUB_OUTPUT
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+            echo "package_name=${PACKAGE_NAME}" >> $GITHUB_OUTPUT
+            echo "Published ${PACKAGE_NAME}@${VERSION}"
+          fi
+
+      - name: Generate Summary
+        run: |
+          echo "## Public NPM Publication Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "### DRY RUN MODE" >> $GITHUB_STEP_SUMMARY
+            echo "No packages were published. This was a test run." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "### Published Package" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.publish.outputs.published }}" != "" ]; then
+            echo "- \`${{ steps.publish.outputs.package_name }}@${VERSION}\`" >> $GITHUB_STEP_SUMMARY
+            echo "  - Tag: \`${NPM_TAG}\`" >> $GITHUB_STEP_SUMMARY
+            echo "  - Registry: https://registry.npmjs.org" >> $GITHUB_STEP_SUMMARY
+            echo "  - Install: \`npm install ${{ steps.publish.outputs.package_name }}@${NPM_TAG}\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "### Links" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.publish.outputs.published }}" != "" ]; then
+            echo "- [View ${{ steps.publish.outputs.package_name }} on npm](https://www.npmjs.com/package/${{ steps.publish.outputs.package_name }})" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Create Git tag
+        if: env.DRY_RUN != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [ "${{ steps.publish.outputs.published }}" = "true" ]; then
+            TAG_NAME="v${VERSION}"
+            git tag -a "$TAG_NAME" -m "Release ${PACKAGE_NAME}@${VERSION}"
+            git push origin "$TAG_NAME"
+            echo "Created tag: $TAG_NAME"
+          fi
+
+      - name: Create GitHub Release
+        if: |
+          env.DRY_RUN != 'true' && 
+          steps.publish.outputs.published == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: "${{ env.PACKAGE_NAME }}@${{ env.VERSION }}"
+          body: |
+            Published to NPM
+
+            **Package**: `${{ env.PACKAGE_NAME }}`
+            **Version**: `${{ env.VERSION }}`
+            **NPM Tag**: `${{ env.NPM_TAG }}`
+
+            ```bash
+            npm install ${{ env.PACKAGE_NAME }}@${{ env.VERSION }}
+            ```
+
+            [View on NPM](https://www.npmjs.com/package/${{ env.PACKAGE_NAME }}/v/${{ env.VERSION }})
+          prerelease: ${{ env.NPM_TAG != 'latest' }}
+          draft: false
+
+      - name: Restore package.json file
+        if: always()
+        run: |
+          git checkout package.json || true
+
+      - name: Handle workflow failure
+        if: failure()
+        run: |
+          echo "## Workflow Failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The workflow encountered an error. Please check the logs above for details." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Common Issues" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Authentication**: Verify NPM_TOKEN secret is configured correctly" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version conflict**: Package version may already exist on npm" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tests failure**: Check if tests pass successfully" >> $GITHUB_STEP_SUMMARY
+          echo "- **Network issues**: NPM registry may be unreachable" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. Review the error logs in this workflow run" >> $GITHUB_STEP_SUMMARY
+          echo "2. Fix the issue and retry the workflow" >> $GITHUB_STEP_SUMMARY
+          echo "3. If needed, manually publish using: \`npm publish\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
